@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strconv"
@@ -27,18 +28,30 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 	payload, err := github.ValidatePayload(r, webhookSecret)
 	if err != nil {
+		log.Printf("Security Error: Invalid webhook signature: %v", err)
 		http.Error(w, "Invalid signature", http.StatusUnauthorized)
 		return
 	}
 
 	event, err := github.ParseWebHook(github.WebHookType(r), payload)
 	if err != nil {
+		log.Printf("Parse Error: Failed to decode webhook payload: %v", err)
 		http.Error(w, "Failed to parse webhook", http.StatusBadRequest)
 		return
 	}
 
-	appID, _ := strconv.ParseInt(os.Getenv("GITHUB_APP_ID"), 10, 64)
-	privateKey := []byte(strings.ReplaceAll(os.Getenv("GITHUB_PRIVATE_KEY"), "\\n", "\n"))
+	rawAppID := strings.TrimSpace(os.Getenv("GITHUB_APP_ID"))
+	appID, err := strconv.ParseInt(rawAppID, 10, 64)
+	if err != nil {
+		log.Printf("CRITICAL: Failed to parse GITHUB_APP_ID '%s': %v", rawAppID, err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	rawKey := strings.TrimSpace(os.Getenv("GITHUB_PRIVATE_KEY"))
+	rawKey = strings.Trim(rawKey, `"'`)
+	rawKey = strings.ReplaceAll(rawKey, "\\n", "\n")
+	privateKey := []byte(rawKey)
 
 	var instID int64
 	switch e := event.(type) {
@@ -55,22 +68,24 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 			instID = e.Installation.GetID()
 		}
 	default:
-		// Acknowledge events we don't handle
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
 		return
 	}
 
 	if instID == 0 {
-		http.Error(w, "No installation ID found in payload", http.StatusBadRequest)
+		log.Printf("Logic Error: No installation ID found in the webhook payload.")
+		http.Error(w, "No installation ID found", http.StatusBadRequest)
 		return
 	}
 
 	itr, err := ghinstallation.New(http.DefaultTransport, appID, instID, privateKey)
 	if err != nil {
+		log.Printf("CRITICAL: GitHub App authentication failed. Check private key formatting. Error: %v", err)
 		http.Error(w, "Failed to authenticate", http.StatusInternalServerError)
 		return
 	}
+
 	client := github.NewClient(&http.Client{Transport: itr})
 	ctx := context.Background()
 
