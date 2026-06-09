@@ -134,21 +134,42 @@ func handleIssueComment(ctx context.Context, client *github.Client, e *github.Is
 		return
 	}
 
-	checkStatus := map[string]string{}
+	sigConclusion := ""
 	for _, run := range checks.CheckRuns {
-		checkStatus[run.GetName()] = run.GetConclusion()
+		if run.GetName() == "Team Signature Verification" {
+			sigConclusion = run.GetConclusion()
+			break
+		}
 	}
 
-	sigConclusion := checkStatus["Team Signature Verification"]
-	approvalConclusion := checkStatus["Team Approval Verification"]
+	// Check current reviews for a live maintainer approval
+	reviews, _, err := client.PullRequests.ListReviews(ctx, org, repo, prNum, nil)
+	if err != nil {
+		msg := "❌ **Merge Blocked:** Could not retrieve PR review status."
+		client.Issues.CreateComment(ctx, org, repo, prNum, &github.IssueComment{Body: &msg})
+		return
+	}
 
-	if sigConclusion != "success" || approvalConclusion != "success" {
+	maintainerApproved := false
+	for _, review := range reviews {
+		if review.GetState() != "APPROVED" {
+			continue
+		}
+		reviewer := review.User.GetLogin()
+		_, _, teamErr := client.Teams.GetTeamMembershipBySlug(ctx, org, repo, reviewer)
+		if teamErr == nil {
+			maintainerApproved = true
+			break
+		}
+	}
+
+	if sigConclusion != "success" || !maintainerApproved {
 		var reasons []string
 		if sigConclusion != "success" {
 			reasons = append(reasons, fmt.Sprintf("- **Team Signature Verification** is `%s`", orDefault(sigConclusion, "pending")))
 		}
-		if approvalConclusion != "success" {
-			reasons = append(reasons, fmt.Sprintf("- **Team Approval Verification** is `%s`", orDefault(approvalConclusion, "pending")))
+		if !maintainerApproved {
+			reasons = append(reasons, "- **Team Approval Verification** — no maintainer approval on record")
 		}
 		msg := fmt.Sprintf("❌ **Merge Blocked:** The following checks have not passed:\n\n%s", strings.Join(reasons, "\n"))
 		client.Issues.CreateComment(ctx, org, repo, prNum, &github.IssueComment{Body: &msg})
@@ -199,19 +220,28 @@ func handlePullRequest(ctx context.Context, client *github.Client, e *github.Pul
 				Event: github.String("APPROVE"),
 				Body:  &body,
 			})
+			client.Checks.CreateCheckRun(ctx, org, repo, github.CreateCheckRunOptions{
+				Name:       "Team Approval Verification",
+				HeadSHA:    headSHA,
+				Status:     github.String("completed"),
+				Conclusion: github.String("success"),
+				Output: &github.CheckRunOutput{
+					Title:   github.String("Maintainer Auto-Approved"),
+					Summary: github.String(fmt.Sprintf("PR was auto-approved because the author (@%s) is the sole authorized maintainer.", author)),
+				},
+			})
+		} else {
+			client.Checks.CreateCheckRun(ctx, org, repo, github.CreateCheckRunOptions{
+				Name:       "Team Approval Verification",
+				HeadSHA:    headSHA,
+				Status:     github.String("completed"),
+				Conclusion: github.String("failure"),
+				Output: &github.CheckRunOutput{
+					Title:   github.String("Awaiting Maintainer Review"),
+					Summary: github.String("This PR requires approval from another authorized maintainer before merging."),
+				},
+			})
 		}
-
-		// Generate a Success Check Run
-		client.Checks.CreateCheckRun(ctx, org, repo, github.CreateCheckRunOptions{
-			Name:       "Team Approval Verification",
-			HeadSHA:    headSHA,
-			Status:     github.String("completed"),
-			Conclusion: github.String("success"),
-			Output: &github.CheckRunOutput{
-				Title:   github.String("Maintainer Auto-Approved"),
-				Summary: github.String(fmt.Sprintf("PR was auto-approved because the author (@%s) is an authorized maintainer.", author)),
-			},
-		})
 	} else {
 		// Author is a community member: Generate a Failure/Pending Check Run
 		client.Checks.CreateCheckRun(ctx, org, repo, github.CreateCheckRunOptions{
