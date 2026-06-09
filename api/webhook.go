@@ -165,12 +165,15 @@ func handlePullRequest(ctx context.Context, client *github.Client, e *github.Pul
 	// -----------------------------------------
 	_, _, err := client.Teams.GetTeamMembershipBySlug(ctx, org, repo, author)
 	if err == nil {
-		// Author is a maintainer: Submit the automated review
-		body := fmt.Sprintf("🤖 **Auto-Approved:** PR authored by an authorized maintainer (@%s).", author)
-		client.PullRequests.CreateReview(ctx, org, repo, prNum, &github.PullRequestReviewRequest{
-			Event: github.String("APPROVE"),
-			Body:  &body,
-		})
+		// Author is a maintainer: only auto-approve if they are the sole maintainer
+		members, _, listErr := client.Teams.ListTeamMembersBySlug(ctx, org, repo, nil)
+		if listErr == nil && len(members) == 1 {
+			body := fmt.Sprintf("🤖 **Auto-Approved:** PR authored by the sole authorized maintainer (@%s).", author)
+			client.PullRequests.CreateReview(ctx, org, repo, prNum, &github.PullRequestReviewRequest{
+				Event: github.String("APPROVE"),
+				Body:  &body,
+			})
+		}
 
 		// Generate a Success Check Run
 		client.Checks.CreateCheckRun(ctx, org, repo, github.CreateCheckRunOptions{
@@ -270,6 +273,7 @@ func handlePullRequest(ctx context.Context, client *github.Client, e *github.Pul
 
 	if checkRun != nil {
 		_, _, err = client.Checks.UpdateCheckRun(ctx, org, repo, checkRun.GetID(), github.UpdateCheckRunOptions{
+			Name:       "Team Signature Verification",
 			Status:     github.String("completed"),
 			Conclusion: github.String(conclusion),
 			Output: &github.CheckRunOutput{
