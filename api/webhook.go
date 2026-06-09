@@ -11,10 +11,6 @@ import (
 
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/bradleyfalzon/ghinstallation/v2"
-	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
-	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/storage/memory"
 	"github.com/google/go-github/v53/github"
 )
 
@@ -220,14 +216,12 @@ func handlePullRequest(ctx context.Context, client *github.Client, e *github.Pul
 
 	allValid := true
 
-	// FIX 1: Fetch from the Fork's repository (Head), not the Base repository!
-	repoURL := e.PullRequest.Head.Repo.GetCloneURL()
-	prBranchRef := e.PullRequest.Head.GetRef()
+	headOwner := e.PullRequest.Head.Repo.Owner.GetLogin()
+	headRepo := e.PullRequest.Head.Repo.GetName()
 
 	for _, commit := range commits {
 		sha := commit.GetSHA()
 
-		// FIX 2: Identify the specific GitHub user who authored the commit
 		var username string
 		if commit.Author != nil && commit.Author.GetLogin() != "" {
 			username = commit.Author.GetLogin()
@@ -241,10 +235,8 @@ func handlePullRequest(ctx context.Context, client *github.Client, e *github.Pul
 			break
 		}
 
-		// FIX 3: Fetch ONLY that specific user's public key (e.g., "andrinoff.txt")
 		keyPath := fmt.Sprintf("%s.txt", username)
 		fileContent, _, _, err := client.Repositories.GetContents(ctx, "oreonhq", "team-sigs", keyPath, nil)
-
 		if err != nil || fileContent == nil {
 			fmt.Printf("No public key found in oreonhq/team-sigs for user: %s\n", username)
 			allValid = false
@@ -253,7 +245,7 @@ func handlePullRequest(ctx context.Context, client *github.Client, e *github.Pul
 
 		asciiKey, _ := fileContent.GetContent()
 
-		valid, err := verifyCommit(repoURL, prBranchRef, sha, asciiKey)
+		valid, err := verifyCommit(ctx, client, headOwner, headRepo, sha, asciiKey)
 		if !valid {
 			fmt.Printf("Verification failed for %s: %v\n", sha, err)
 			allValid = false
@@ -318,50 +310,25 @@ func handlePullRequestReview(ctx context.Context, client *github.Client, e *gith
 	}
 }
 
-func verifyCommit(repoURL, prBranchRef, commitSHA, asciiPublicKey string) (bool, error) {
+func verifyCommit(ctx context.Context, client *github.Client, owner, repo, commitSHA, asciiPublicKey string) (bool, error) {
 	keyring, err := openpgp.ReadArmoredKeyRing(strings.NewReader(asciiPublicKey))
 	if err != nil {
 		return false, fmt.Errorf("err: %v", err)
 	}
 
-	repo, err := git.Clone(memory.NewStorage(), nil, &git.CloneOptions{
-		URL: repoURL,
-	})
+	gitCommit, _, err := client.Git.GetCommit(ctx, owner, repo, commitSHA)
 	if err != nil {
 		return false, fmt.Errorf("err: %v", err)
 	}
 
-	err = repo.Fetch(&git.FetchOptions{
-		RefSpecs: []config.RefSpec{config.RefSpec(fmt.Sprintf("+%s:%s", prBranchRef, prBranchRef))},
-	})
-	if err != nil && err != git.NoErrAlreadyUpToDate {
-		return false, fmt.Errorf("err: %v", err)
-	}
-
-	hash := plumbing.NewHash(commitSHA)
-	commit, err := repo.CommitObject(hash)
-	if err != nil {
-		return false, fmt.Errorf("err: %v", err)
-	}
-
-	if commit.PGPSignature == "" {
+	if gitCommit.Verification == nil || gitCommit.Verification.GetSignature() == "" {
 		return false, fmt.Errorf("err: no sig")
 	}
 
-	obj := &plumbing.MemoryObject{}
-	err = commit.EncodeWithoutSignature(obj)
-	if err != nil {
-		return false, fmt.Errorf("err: %v", err)
-	}
+	sig := strings.NewReader(gitCommit.Verification.GetSignature())
+	payload := strings.NewReader(gitCommit.Verification.GetPayload())
 
-	reader, err := obj.Reader()
-	if err != nil {
-		return false, fmt.Errorf("err: %v", err)
-	}
-
-	signature := strings.NewReader(commit.PGPSignature)
-
-	_, err = openpgp.CheckArmoredDetachedSignature(keyring, reader, signature, nil)
+	_, err = openpgp.CheckArmoredDetachedSignature(keyring, payload, sig, nil)
 	if err != nil {
 		return false, fmt.Errorf("err: %v", err)
 	}
