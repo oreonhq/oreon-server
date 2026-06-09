@@ -125,8 +125,38 @@ func handleIssueComment(ctx context.Context, client *github.Client, e *github.Is
 		return
 	}
 
+	headSHA := pr.Head.GetSHA()
+
+	checks, _, err := client.Checks.ListCheckRunsForRef(ctx, org, repo, headSHA, nil)
+	if err != nil {
+		msg := "❌ **Merge Blocked:** Could not retrieve check run status."
+		client.Issues.CreateComment(ctx, org, repo, prNum, &github.IssueComment{Body: &msg})
+		return
+	}
+
+	checkStatus := map[string]string{}
+	for _, run := range checks.CheckRuns {
+		checkStatus[run.GetName()] = run.GetConclusion()
+	}
+
+	sigConclusion := checkStatus["Team Signature Verification"]
+	approvalConclusion := checkStatus["Team Approval Verification"]
+
+	if sigConclusion != "success" || approvalConclusion != "success" {
+		var reasons []string
+		if sigConclusion != "success" {
+			reasons = append(reasons, fmt.Sprintf("- **Team Signature Verification** is `%s`", orDefault(sigConclusion, "pending")))
+		}
+		if approvalConclusion != "success" {
+			reasons = append(reasons, fmt.Sprintf("- **Team Approval Verification** is `%s`", orDefault(approvalConclusion, "pending")))
+		}
+		msg := fmt.Sprintf("❌ **Merge Blocked:** The following checks have not passed:\n\n%s", strings.Join(reasons, "\n"))
+		client.Issues.CreateComment(ctx, org, repo, prNum, &github.IssueComment{Body: &msg})
+		return
+	}
+
 	ref := fmt.Sprintf("heads/%s", pr.Base.GetRef())
-	sha := pr.Head.GetSHA()
+	sha := headSHA
 	force := false
 
 	_, _, err = client.Git.UpdateRef(ctx, org, repo, &github.Reference{
@@ -308,6 +338,13 @@ func handlePullRequestReview(ctx context.Context, client *github.Client, e *gith
 	if err != nil {
 		fmt.Printf("Failed to update check run for review: %v\n", err)
 	}
+}
+
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }
 
 func verifyCommit(ctx context.Context, client *github.Client, owner, repo, commitSHA, asciiPublicKey string) (bool, error) {
