@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -127,20 +128,19 @@ func handleIssueComment(ctx context.Context, client *github.Client, e *github.Is
 
 	headSHA := pr.Head.GetSHA()
 
-	sigChecks, _, err := client.Checks.ListCheckRunsForRef(ctx, org, repo, headSHA, &github.ListCheckRunsOptions{
-		CheckName: github.String("Team Signature Verification"),
-		Filter:    github.String("latest"),
-	})
-	if err != nil {
-		msg := "❌ **Merge Blocked:** Could not retrieve check run status."
-		client.Issues.CreateComment(ctx, org, repo, prNum, &github.IssueComment{Body: &msg})
-		return
+	conclusionFor := func(name string) string {
+		result, _, e := client.Checks.ListCheckRunsForRef(ctx, org, repo, headSHA, &github.ListCheckRunsOptions{
+			CheckName: github.String(name),
+			Filter:    github.String("latest"),
+		})
+		if e != nil || len(result.CheckRuns) == 0 {
+			return ""
+		}
+		return result.CheckRuns[0].GetConclusion()
 	}
 
-	sigConclusion := ""
-	if len(sigChecks.CheckRuns) > 0 {
-		sigConclusion = sigChecks.CheckRuns[0].GetConclusion()
-	}
+	sigConclusion := conclusionFor("Team Signature Verification")
+	semConclusion := conclusionFor("Semantic Commit Verification")
 
 	// If the PR author is the sole maintainer, the bot auto-approved on their
 	// behalf — no separate review is needed.
@@ -171,14 +171,49 @@ func handleIssueComment(ctx context.Context, client *github.Client, e *github.Is
 		}
 	}
 
-	if sigConclusion != "success" || !maintainerApproved {
+	// Sweep all other check runs, paginating until done.
+	ownChecks := map[string]bool{
+		"Team Signature Verification": true,
+		"Team Approval Verification":  true,
+		"Semantic Commit Verification": true,
+	}
+	var failingChecks []string
+	page := 1
+	for {
+		result, _, err := client.Checks.ListCheckRunsForRef(ctx, org, repo, headSHA, &github.ListCheckRunsOptions{
+			Filter:      github.String("latest"),
+			ListOptions: github.ListOptions{Page: page, PerPage: 100},
+		})
+		if err != nil {
+			break
+		}
+		for _, run := range result.CheckRuns {
+			if ownChecks[run.GetName()] {
+				continue
+			}
+			c := run.GetConclusion()
+			if c != "success" && c != "neutral" && c != "skipped" {
+				failingChecks = append(failingChecks, fmt.Sprintf("- **%s** is `%s`", run.GetName(), orDefault(c, "pending")))
+			}
+		}
+		if len(result.CheckRuns) < 100 {
+			break
+		}
+		page++
+	}
+
+	if sigConclusion != "success" || semConclusion != "success" || !maintainerApproved || len(failingChecks) > 0 {
 		var reasons []string
 		if sigConclusion != "success" {
 			reasons = append(reasons, fmt.Sprintf("- **Team Signature Verification** is `%s`", orDefault(sigConclusion, "pending")))
 		}
+		if semConclusion != "success" {
+			reasons = append(reasons, fmt.Sprintf("- **Semantic Commit Verification** is `%s`", orDefault(semConclusion, "pending")))
+		}
 		if !maintainerApproved {
 			reasons = append(reasons, "- **Team Approval Verification** — no maintainer approval on record")
 		}
+		reasons = append(reasons, failingChecks...)
 		msg := fmt.Sprintf("❌ **Merge Blocked:** The following checks have not passed:\n\n%s", strings.Join(reasons, "\n"))
 		client.Issues.CreateComment(ctx, org, repo, prNum, &github.IssueComment{Body: &msg})
 		return
@@ -345,6 +380,54 @@ func handlePullRequest(ctx context.Context, client *github.Client, e *github.Pul
 			fmt.Printf("Failed to update check run: %v\n", err)
 		}
 	}
+
+	// -----------------------------------------
+	// FEATURE 3: SEMANTIC COMMIT VERIFICATION
+	// -----------------------------------------
+	semanticRE := regexp.MustCompile(`^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?(!)?: .+`)
+
+	var badCommits []string
+	for _, commit := range commits {
+		full := commit.Commit.GetMessage()
+		parts := strings.SplitN(full, "\n", 2)
+		subject := parts[0]
+		short := commit.GetSHA()[:7]
+
+		if !semanticRE.MatchString(subject) {
+			badCommits = append(badCommits, fmt.Sprintf("- `%s` — not a semantic commit: `%s`", short, subject))
+			continue
+		}
+		if len(subject) > 40 {
+			badCommits = append(badCommits, fmt.Sprintf("- `%s` — title too long (%d chars, max 40): `%s`", short, len(subject), subject))
+		}
+		body := ""
+		if len(parts) > 1 {
+			body = strings.TrimSpace(parts[1])
+		}
+		if body == "" {
+			badCommits = append(badCommits, fmt.Sprintf("- `%s` — missing commit description", short))
+		}
+	}
+
+	semConclusion := "success"
+	semTitle := "Semantic Commits Verified"
+	semSummary := "All commit messages follow the Conventional Commits specification, are within the 40-character title limit, and include a description."
+	if len(badCommits) > 0 {
+		semConclusion = "failure"
+		semTitle = "Commit Message Issues Detected"
+		semSummary = fmt.Sprintf("The following commits have issues:\n\n%s\n\nRules: semantic format (`<type>[scope]: <desc>`), title ≤ 40 chars, body required.", strings.Join(badCommits, "\n"))
+	}
+
+	client.Checks.CreateCheckRun(ctx, org, repo, github.CreateCheckRunOptions{
+		Name:       "Semantic Commit Verification",
+		HeadSHA:    headSHA,
+		Status:     github.String("completed"),
+		Conclusion: github.String(semConclusion),
+		Output: &github.CheckRunOutput{
+			Title:   github.String(semTitle),
+			Summary: github.String(semSummary),
+		},
+	})
 }
 
 func handlePullRequestReview(ctx context.Context, client *github.Client, e *github.PullRequestReviewEvent) {
