@@ -291,10 +291,10 @@ func handlePullRequest(ctx context.Context, client *github.Client, e *github.Pul
 		sha := commit.GetSHA()
 
 		var username string
-		if commit.Author != nil && commit.Author.GetLogin() != "" {
-			username = commit.Author.GetLogin()
-		} else if commit.Committer != nil && commit.Committer.GetLogin() != "" {
+		if commit.Committer != nil && commit.Committer.GetLogin() != "" {
 			username = commit.Committer.GetLogin()
+		} else if commit.Author != nil && commit.Author.GetLogin() != "" {
+			username = commit.Author.GetLogin()
 		}
 
 		if username == "" {
