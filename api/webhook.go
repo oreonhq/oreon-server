@@ -127,7 +127,10 @@ func handleIssueComment(ctx context.Context, client *github.Client, e *github.Is
 
 	headSHA := pr.Head.GetSHA()
 
-	checks, _, err := client.Checks.ListCheckRunsForRef(ctx, org, repo, headSHA, nil)
+	sigChecks, _, err := client.Checks.ListCheckRunsForRef(ctx, org, repo, headSHA, &github.ListCheckRunsOptions{
+		CheckName: github.String("Team Signature Verification"),
+		Filter:    github.String("latest"),
+	})
 	if err != nil {
 		msg := "❌ **Merge Blocked:** Could not retrieve check run status."
 		client.Issues.CreateComment(ctx, org, repo, prNum, &github.IssueComment{Body: &msg})
@@ -135,31 +138,36 @@ func handleIssueComment(ctx context.Context, client *github.Client, e *github.Is
 	}
 
 	sigConclusion := ""
-	for _, run := range checks.CheckRuns {
-		if run.GetName() == "Team Signature Verification" {
-			sigConclusion = run.GetConclusion()
-			break
-		}
+	if len(sigChecks.CheckRuns) > 0 {
+		sigConclusion = sigChecks.CheckRuns[0].GetConclusion()
 	}
 
-	// Check current reviews for a live maintainer approval
-	reviews, _, err := client.PullRequests.ListReviews(ctx, org, repo, prNum, nil)
-	if err != nil {
-		msg := "❌ **Merge Blocked:** Could not retrieve PR review status."
-		client.Issues.CreateComment(ctx, org, repo, prNum, &github.IssueComment{Body: &msg})
-		return
-	}
-
+	// If the PR author is the sole maintainer, the bot auto-approved on their
+	// behalf — no separate review is needed.
 	maintainerApproved := false
-	for _, review := range reviews {
-		if review.GetState() != "APPROVED" {
-			continue
+	members, _, listErr := client.Teams.ListTeamMembersBySlug(ctx, org, repo, nil)
+	if listErr == nil && len(members) == 1 {
+		_, _, authorErr := client.Teams.GetTeamMembershipBySlug(ctx, org, repo, pr.User.GetLogin())
+		maintainerApproved = authorErr == nil
+	}
+
+	// For multi-maintainer repos, require a human maintainer approval.
+	if !maintainerApproved {
+		reviews, _, err := client.PullRequests.ListReviews(ctx, org, repo, prNum, nil)
+		if err != nil {
+			msg := "❌ **Merge Blocked:** Could not retrieve PR review status."
+			client.Issues.CreateComment(ctx, org, repo, prNum, &github.IssueComment{Body: &msg})
+			return
 		}
-		reviewer := review.User.GetLogin()
-		_, _, teamErr := client.Teams.GetTeamMembershipBySlug(ctx, org, repo, reviewer)
-		if teamErr == nil {
-			maintainerApproved = true
-			break
+		for _, review := range reviews {
+			if review.GetState() != "APPROVED" {
+				continue
+			}
+			_, _, teamErr := client.Teams.GetTeamMembershipBySlug(ctx, org, repo, review.User.GetLogin())
+			if teamErr == nil {
+				maintainerApproved = true
+				break
+			}
 		}
 	}
 
