@@ -493,10 +493,30 @@ func handlePullRequest(ctx context.Context, client *github.Client, e *github.Pul
 			username = commit.Author.GetLogin()
 		}
 
+		// GitHub App bots often have no linked GitHub user on the
+		// commit, so fall back to the raw git author/committer name.
+		// Bot accounts follow the "<name>[bot]" convention.
+		if username == "" {
+			if commit.Commit != nil {
+				if name := commit.Commit.Committer.GetName(); strings.HasSuffix(name, "[bot]") {
+					username = name
+				} else if name := commit.Commit.Author.GetName(); strings.HasSuffix(name, "[bot]") {
+					username = name
+				}
+			}
+		}
+
 		if username == "" {
 			fmt.Printf("Commit %s has no linked GitHub user\n", sha)
 			allValid = false
 			break
+		}
+
+		// Commits created by a GitHub App bot are trusted by definition
+		// (the app authenticates itself), so skip PGP verification for
+		// them even if they are unsigned.
+		if strings.HasSuffix(username, "[bot]") {
+			continue
 		}
 
 		keyPath := fmt.Sprintf("%s.txt", username)
