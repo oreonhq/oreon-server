@@ -15,6 +15,8 @@ import (
 	"github.com/ProtonMail/go-crypto/openpgp"
 	"github.com/bradleyfalzon/ghinstallation/v2"
 	"github.com/google/go-github/v53/github"
+
+	"github.com/oreonhq/bot/pkg/buildservice"
 )
 
 const gpl3License = `                    GNU GENERAL PUBLIC LICENSE
@@ -609,6 +611,176 @@ func handlePullRequest(ctx context.Context, client *github.Client, e *github.Pul
 			Summary: github.String(semSummary),
 		},
 	})
+
+	// -----------------------------------------
+	// FEATURE 4: RPM BUILD CI (rpm-specfiles only)
+	// -----------------------------------------
+	if repo == "rpm-specfiles" {
+		triggerRPMBuildCI(ctx, client, org, repo, prNum, headSHA, e.PullRequest)
+	}
+}
+
+func triggerRPMBuildCI(
+	ctx context.Context,
+	client *github.Client,
+	org, repo string,
+	prNum int,
+	headSHA string,
+	pr *github.PullRequest,
+) {
+	headBranch := pr.GetHead().GetRef()
+	baseBranch := pr.GetBase().GetRef()
+
+	if headBranch == "" {
+		headBranch = pr.GetHead().GetLabel()
+	}
+
+	comparison, _, err := client.Repositories.CompareCommits(ctx, org, repo, baseBranch, headSHA, nil)
+	if err != nil {
+		log.Printf("RPM Build CI: compare commits failed for PR %d: %v", prNum, err)
+		createRPMBuildCheckRunNeutral(ctx, client, org, repo, headSHA, prNum,
+			"Could not compare branches",
+			fmt.Sprintf("Failed to get changed files: %v", err))
+		return
+	}
+
+	packageNames := extractPackageNamesFromDiff(comparison)
+	if len(packageNames) == 0 {
+		log.Printf("RPM Build CI: no spec file changes detected in PR %d", prNum)
+		createRPMBuildCheckRunNeutral(ctx, client, org, repo, headSHA, prNum,
+			"No spec files changed",
+			"No `.spec` file changes detected in this PR. RPM build CI is skipped.")
+		return
+	}
+
+	buildClient := buildservice.NewBuildServiceClient()
+
+	release, err := buildClient.GetReleaseByName("oreon-11-rp1")
+	if err != nil {
+		log.Printf("RPM Build CI: get release failed: %v", err)
+		createRPMBuildCheckRunNeutral(ctx, client, org, repo, headSHA, prNum,
+			"Build service unavailable",
+			fmt.Sprintf("Could not find release `oreon-11-rp1`: %v", err))
+		return
+	}
+
+	_, _, err = client.Checks.CreateCheckRun(ctx, org, repo, github.CreateCheckRunOptions{
+		Name:     "RPM Build",
+		HeadSHA:  headSHA,
+		Status:   github.String("in_progress"),
+		Output: &github.CheckRunOutput{
+			Title:   github.String("RPM Build in Progress"),
+			Summary: github.String(fmt.Sprintf("Building packages: %s\n\nDependencies are being resolved and the build chain will start shortly.", strings.Join(packageNames, ", "))),
+		},
+	})
+	if err != nil {
+		log.Printf("RPM Build CI: create initial check run failed for PR %d: %v", prNum, err)
+		return
+	}
+
+	resp, err := buildClient.TriggerCIChainBuild(buildservice.CIChainTriggerRequest{
+		Packages:      packageNames,
+		DistgitBranch: headBranch,
+		ReleaseID:     release.ID,
+		Architectures: []string{"x86_64", "aarch64"},
+		DistgitURL:    "https://github.com/oreonhq/rpm-specfiles.git",
+		Priority:      10,
+	})
+	if err != nil {
+		log.Printf("RPM Build CI: trigger chain build failed for PR %d: %v", prNum, err)
+		createRPMBuildCheckRunNeutral(ctx, client, org, repo, headSHA, prNum,
+			"Build trigger failed",
+			fmt.Sprintf("Failed to trigger build: %v", err))
+		return
+	}
+
+	log.Printf("RPM Build CI: PR %d chain %d triggered, stages=%v", prNum, resp.ChainID, resp.Stages)
+
+	extID, _ := json.Marshal(ciCheckExternalID{
+		ChainID:    resp.ChainID,
+		PRNumber:   prNum,
+		HeadSHA:    headSHA,
+		HeadBranch: headBranch,
+		BaseBranch: baseBranch,
+	})
+
+	var stageSummary strings.Builder
+	stageSummary.WriteString(fmt.Sprintf("Chain ID: `%d`\n", resp.ChainID))
+	stageSummary.WriteString(fmt.Sprintf("Chain spec: `%s`\n\n", resp.ChainSpec))
+	if len(resp.Stages) > 0 {
+		stageSummary.WriteString("**Build stages:**\n")
+		for i, stage := range resp.Stages {
+			stageSummary.WriteString(fmt.Sprintf("%d. %s\n", i+1, strings.Join(stage, ", ")))
+		}
+	}
+
+	_, _, err = client.Checks.CreateCheckRun(ctx, org, repo, github.CreateCheckRunOptions{
+		Name:       "RPM Build",
+		HeadSHA:    headSHA,
+		Status:     github.String("in_progress"),
+		ExternalID: github.String(string(extID)),
+		Output: &github.CheckRunOutput{
+			Title:   github.String("RPM Build in Progress"),
+			Summary: github.String(stageSummary.String()),
+		},
+	})
+	if err != nil {
+		log.Printf("RPM Build CI: update check run with chain_id failed for PR %d: %v", prNum, err)
+	}
+}
+
+func extractPackageNamesFromDiff(comparison *github.CommitsComparison) []string {
+	seen := make(map[string]bool)
+	var names []string
+
+	for _, file := range comparison.Files {
+		filename := file.GetFilename()
+		status := file.GetStatus()
+		if status == "removed" {
+			continue
+		}
+
+		parts := strings.Split(filename, "/")
+		if len(parts) < 2 {
+			continue
+		}
+
+		base := parts[len(parts)-1]
+		if !strings.HasSuffix(base, ".spec") {
+			continue
+		}
+
+		pkgName := strings.TrimSuffix(base, ".spec")
+		if pkgName == "" || seen[pkgName] {
+			continue
+		}
+		seen[pkgName] = true
+		names = append(names, pkgName)
+	}
+
+	return names
+}
+
+func createRPMBuildCheckRunNeutral(
+	ctx context.Context,
+	client *github.Client,
+	org, repo, headSHA string,
+	prNum int,
+	title, summary string,
+) {
+	_, _, err := client.Checks.CreateCheckRun(ctx, org, repo, github.CreateCheckRunOptions{
+		Name:       "RPM Build",
+		HeadSHA:    headSHA,
+		Status:     github.String("completed"),
+		Conclusion: github.String("neutral"),
+		Output: &github.CheckRunOutput{
+			Title:   github.String(title),
+			Summary: github.String(summary),
+		},
+	})
+	if err != nil {
+		log.Printf("RPM Build CI: create neutral check run failed for PR %d: %v", prNum, err)
+	}
 }
 
 func handlePullRequestReview(ctx context.Context, client *github.Client, e *github.PullRequestReviewEvent) {
