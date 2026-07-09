@@ -58,7 +58,7 @@ func BuildCallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("BuildCallback: chain_id=%d status=%s", payload.ChainID, payload.Status)
 
-	go processChainCallback(payload)
+	processChainCallback(payload)
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprint(w, "accepted")
@@ -122,11 +122,11 @@ func processChainCallback(payload ciCallbackPayload) {
 }
 
 func findInstallationID(ctx context.Context, appID int64, rawKey string) (int64, error) {
- itr, err := ghinstallation.New(http.DefaultTransport, appID, 0, []byte(rawKey))
+	atr, err := ghinstallation.NewAppsTransport(http.DefaultTransport, appID, []byte(rawKey))
 	if err != nil {
 		return 0, err
 	}
-	appClient := github.NewClient(&http.Client{Transport: itr})
+	appClient := github.NewClient(&http.Client{Transport: atr})
 	installs, _, err := appClient.Apps.ListInstallations(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -143,41 +143,53 @@ func findInstallationID(ctx context.Context, appID int64, rawKey string) (int64,
 }
 
 func findCheckRunForChain(ctx context.Context, client *github.Client, org, repo string, chainID int) (prNum int, headSHA string, checkRunID int64, err error) {
-	prs, _, lerr := client.PullRequests.List(ctx, org, repo, &github.PullRequestListOptions{
-		State:       "open",
-		ListOptions: github.ListOptions{PerPage: 100},
-	})
-	if lerr != nil {
-		return 0, "", 0, fmt.Errorf("list PRs: %w", lerr)
-	}
-
 	target := fmt.Sprintf(`"chain_id":%d`, chainID)
 
-	for _, pr := range prs {
-		sha := pr.GetHead().GetSHA()
-		if sha == "" {
-			continue
-		}
-
-		runs, _, rerr := client.Checks.ListCheckRunsForRef(ctx, org, repo, sha, &github.ListCheckRunsOptions{
-			CheckName: github.String("RPM Build"),
-			Filter:    github.String("latest"),
+	page := 1
+	for {
+		prs, _, lerr := client.PullRequests.List(ctx, org, repo, &github.PullRequestListOptions{
+			State:       "open",
+			ListOptions: github.ListOptions{PerPage: 100, Page: page},
 		})
-		if rerr != nil {
-			continue
+		if lerr != nil {
+			return 0, "", 0, fmt.Errorf("list PRs page %d: %w", page, lerr)
+		}
+		if len(prs) == 0 {
+			break
 		}
 
-		for _, cr := range runs.CheckRuns {
-			if cr.GetStatus() != "in_progress" {
+		for _, pr := range prs {
+			sha := pr.GetHead().GetSHA()
+			if sha == "" {
 				continue
 			}
-			ext := cr.GetExternalID()
-			if ext == "" || !strings.Contains(ext, target) {
+
+			runs, _, rerr := client.Checks.ListCheckRunsForRef(ctx, org, repo, sha, &github.ListCheckRunsOptions{
+				CheckName: github.String("RPM Build"),
+				Filter:    github.String("latest"),
+			})
+			if rerr != nil {
 				continue
 			}
-			return pr.GetNumber(), sha, cr.GetID(), nil
+
+			for _, cr := range runs.CheckRuns {
+				if cr.GetStatus() != "in_progress" {
+					continue
+				}
+				ext := cr.GetExternalID()
+				if ext == "" || !strings.Contains(ext, target) {
+					continue
+				}
+				return pr.GetNumber(), sha, cr.GetID(), nil
+			}
 		}
+
+		if len(prs) < 100 {
+			break
+		}
+		page++
 	}
+
 	return 0, "", 0, nil
 }
 
@@ -257,22 +269,35 @@ func finalizeChainFailure(
 
 	var failedJobs []buildservice.BuildJobResponse
 	for _, job := range jobs {
-		if job.Status == "failed" || job.DisplayStatus == "failed" {
+		if job.Status == "failed" || job.DisplayStatus == "failed" ||
+			job.Status == "cancelled" || job.DisplayStatus == "cancelled" {
 			failedJobs = append(failedJobs, job)
 		}
 	}
 
 	var sb strings.Builder
-	if errorMessage != "" {
-		sb.WriteString(fmt.Sprintf("❌ **RPM Build Failed** — %s\n\n", errorMessage))
+	if chainStatus == "cancelled" {
+		if errorMessage != "" {
+			sb.WriteString(fmt.Sprintf("⛔ **RPM Build Cancelled** — %s\n\n", errorMessage))
+		} else {
+			sb.WriteString("⛔ **RPM Build Cancelled**\n\n")
+		}
 	} else {
-		sb.WriteString("❌ **RPM Build Failed**\n\n")
+		if errorMessage != "" {
+			sb.WriteString(fmt.Sprintf("❌ **RPM Build Failed** — %s\n\n", errorMessage))
+		} else {
+			sb.WriteString("❌ **RPM Build Failed**\n\n")
+		}
 	}
 
 	if len(failedJobs) == 0 {
-		sb.WriteString("No failed jobs identified. The chain may have been cancelled.\n")
+		if chainStatus == "cancelled" {
+			sb.WriteString("No failed jobs identified. The chain was cancelled before any job failed.\n")
+		} else {
+			sb.WriteString("No failed jobs identified. The chain may have been cancelled.\n")
+		}
 	} else {
-		sb.WriteString(fmt.Sprintf("**Failed job(s):** %d\n\n", len(failedJobs)))
+		sb.WriteString(fmt.Sprintf("**Affected job(s):** %d\n\n", len(failedJobs)))
 	}
 
 	for _, job := range failedJobs {
@@ -329,8 +354,10 @@ func finalizeChainFailure(
 	}
 
 	conclusion := "failure"
+	title := "RPM Build Failed"
 	if chainStatus == "cancelled" {
 		conclusion = "cancelled"
+		title = "RPM Build Cancelled"
 	}
 
 	_, _, err = client.Checks.UpdateCheckRun(ctx, org, repo, checkRunID, github.UpdateCheckRunOptions{
@@ -338,7 +365,7 @@ func finalizeChainFailure(
 		Status:     github.String("completed"),
 		Conclusion: github.String(conclusion),
 		Output: &github.CheckRunOutput{
-			Title:   github.String("RPM Build Failed"),
+			Title:   github.String(title),
 			Summary: github.String(truncateForLog(sb.String(), 65000)),
 		},
 	})
