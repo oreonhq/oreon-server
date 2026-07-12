@@ -264,6 +264,10 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 
 func handleIssueComment(ctx context.Context, client *github.Client, e *github.IssueCommentEvent) {
 	comment := strings.TrimSpace(e.Comment.GetBody())
+	if comment == "/build" || comment == "/b" {
+		handleBuildCommand(ctx, client, e)
+		return
+	}
 	if comment != "/m" && comment != "/merge-ff" {
 		return
 	}
@@ -611,13 +615,35 @@ func handlePullRequest(ctx context.Context, client *github.Client, e *github.Pul
 			Summary: github.String(semSummary),
 		},
 	})
+}
 
-	// -----------------------------------------
-	// FEATURE 4: RPM BUILD CI (rpm-specfiles only)
-	// -----------------------------------------
-	if repo == "rpm-specfiles" {
-		triggerRPMBuildCI(ctx, client, org, repo, prNum, headSHA, e.PullRequest)
+func handleBuildCommand(ctx context.Context, client *github.Client, e *github.IssueCommentEvent) {
+	if !e.Issue.IsPullRequest() {
+		return
 	}
+
+	org := e.Repo.Owner.GetLogin()
+	repo := e.Repo.GetName()
+	if repo != "rpm-specfiles" {
+		return
+	}
+
+	commenter := e.Sender.GetLogin()
+	prNum := e.Issue.GetNumber()
+
+	_, _, err := client.Teams.GetTeamMembershipBySlug(ctx, org, repo, commenter)
+	if err != nil {
+		msg := fmt.Sprintf("❌ **Access Denied:** @%s, you are not a member of the `%s` maintainers team.", commenter, repo)
+		client.Issues.CreateComment(ctx, org, repo, prNum, &github.IssueComment{Body: &msg})
+		return
+	}
+
+	pr, _, err := client.PullRequests.Get(ctx, org, repo, prNum)
+	if err != nil {
+		return
+	}
+
+	triggerRPMBuildCI(ctx, client, org, repo, prNum, pr.Head.GetSHA(), pr)
 }
 
 func triggerRPMBuildCI(
